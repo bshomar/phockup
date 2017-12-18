@@ -5,8 +5,10 @@ import os
 import shutil
 import sys
 import re
+import logging
 from datetime import datetime
 from subprocess import check_output, CalledProcessError
+from progress import ProgressBar
 
 version = '1.4.0'
 
@@ -16,15 +18,19 @@ def main(argv):
 
     move_files = False
     date_regex = None
+    log_fname = None
+    sha_rename = False
     dir_format = os.path.sep.join(['%Y', '%m', '%d'])
 
     try:
-        opts, args = getopt.getopt(argv[2:], "d:r:mh", ["date=", "regex=", "move", "help"])
-    except getopt.GetoptError:
+        opts, args = getopt.getopt(argv[2:], "d:r:l:mhs", ["date=", "regex=", "log=", "move", "help","sha-rename"])
+    except getopt.GetoptError as e:
+        print(e)
         help_info()
 
     for opt, arg in opts:
         if opt in ("-h", "--help"):
+            print('Printing help:')
             help_info()
 
         if opt in ("-d", "--date"):
@@ -33,9 +39,19 @@ def main(argv):
                 sys.exit(0)
             dir_format = parse_date_format(arg)
 
+        if opt in ("-l", "--log"):
+            if not arg:
+                print("log file name can't be empty")
+                sys.exit(0)
+            log_fname = arg
+
         if opt in ("-m", "--move"):
             move_files = True
             print('Using move strategy!')
+
+        if opt in ("-s", "--sha-rename"):
+            sha_rename = True
+            print('Renaming files to SHA256 name!')
 
         if opt in ("-r", "--regex"):
             try:
@@ -44,6 +60,8 @@ def main(argv):
                 error("Provided regex is invalid!")
 
     if len(argv) < 2:
+        print('ERROR: Number of arguments are less than 2')
+        print(argv)
         help_info()
 
     inputdir = os.path.expanduser(argv[0])
@@ -59,17 +77,52 @@ def main(argv):
             print('Cannot create output directory. No write access!')
             sys.exit(0)
 
-    ignored_files = ('.DS_Store', 'Thumbs.db')
+    if log_fname:
+        logging.basicConfig(filename=log_fname, level='DEBUG')
+    else:
+        logging.basicConfig(level='CRITICAL')
 
+    ignored_files = ('.DS_Store', 'Thumbs.db')
+    error_list = list()
+    count = dict(copied=0, moved=0, duplicate=0, error=0, other=0 )
+    total_count=0
+    for _, _, files in os.walk(inputdir): total_count += len(files)
+    bar = ProgressBar(total_count, count.keys())
     for root, _, files in os.walk(inputdir):
         for filename in files:
             try:
                 if filename in ignored_files:
                     continue
-                handle_file(os.path.join(root, filename), outputdir, dir_format, move_files, date_regex)
+                if not sha_rename:
+                    status = handle_file(os.path.join(root, filename), outputdir, dir_format, move_files, date_regex)
+                else:
+                    status = handle_file2(os.path.join(root, filename), outputdir, dir_format, move_files, date_regex)
+                count[status] += 1
+                bar.increment(status)
             except KeyboardInterrupt:
-                print(' Exiting...')
+                print('\n Exiting...')
+                print_summary(count)
                 sys.exit(0)
+            except Exception as e :
+                logging.error('Error skipping %s:%s' % (filename,repr(e)))
+                error_list.append(os.path.join(root, filename))
+                count['error'] += 1
+                bar.increment('error')
+    bar.done()
+    logging.info('===Files with Errors===')
+    for fn in error_list:
+        logging.info(fn)
+    logging.info('===End Files with Errors===')
+    print_summary(count)
+
+def print_summary(summary: dict):
+    total = sum(summary.values())
+    logging.info('%s:\t%s\t%.0f%%' % ('total', total, 100.0))
+    print('%s:\t%s\t%.0f%%' % ('total', total, 100.0))
+    for key,value in summary.items():
+        logging.info('%s:\t%s\t%.0f%%' % (key,value,100*value/total))
+        print('%s:\t%s\t%.0f%%' % (key, value, 100 * value / total))
+
 
 
 def check_dependencies():
@@ -93,7 +146,7 @@ def parse_date_format(date):
 
 def exif(file):
     try:
-        data = check_output(['exiftool', file]).decode('UTF-8').strip().split("\\n")[0].split("\n")
+        data = check_output(['exiftool', file]).decode('UTF-8',"ignore").strip().split("\\n")[0].split("\n")
         exif_data = {}
     except (CalledProcessError, UnicodeDecodeError):
         return None
@@ -105,9 +158,10 @@ def exif(file):
     return exif_data
 
 
-def get_date(file, exif_data, user_regex=None):
-    keys = ['Create Date', 'Date/Time Original']
-
+def get_date(file, exif_data, user_regex=None, use_modification_date=False):
+    keys = ['Create Date', 'Date/Time Original', 'Media created']
+    if use_modification_date:
+        keys.append('File Modification Date/Time')
     datestr = None
 
     for key in keys:
@@ -217,16 +271,18 @@ def get_file_name(file, date):
 
 def is_image_or_video(exif_data):
     pattern = re.compile('^(image/.+|video/.+|application/vnd.adobe.photoshop)$')
-    if pattern.match(exif_data['MIME Type']):
+    if exif_data and pattern.match(exif_data['MIME Type']):
         return True
     return False
 
 
 def handle_file(source_file, outputdir, dir_format, move_files, date_regex=None):
     if str.endswith(source_file, '.xmp'):
-        return None
+        return 'other'
 
-    print(source_file, end="", flush=True)
+    status = 'other'
+    info = source_file
+    #print(source_file, end="", flush=True)
 
     exif_data = exif(source_file)
 
@@ -245,21 +301,63 @@ def handle_file(source_file, outputdir, dir_format, move_files, date_regex=None)
     while True:
         if os.path.isfile(target_file):
             if sha256_checksum(source_file) == sha256_checksum(target_file):
-                print(' => skipped, duplicated file')
+                info += ' => skipped, duplicated file'
+                status = 'duplicate'
                 break
         else:
             if move_files:
                 shutil.move(source_file, target_file)
+                status = 'moved'
             else:
                 shutil.copy2(source_file, target_file)
+                status = 'copied'
 
-            print(' => %s' % target_file)
+            info += ' => %s' % target_file
             handle_file_xmp(source_file, target_file_name, suffix, output_dir, move_files)
             break
 
         suffix += 1
         target_split = os.path.splitext(target_file_path)
         target_file = "%s-%d%s" % (target_split[0], suffix, target_split[1])
+    logging.info(info)
+    return status
+
+def handle_file2(source_file, outputdir, dir_format, move_files, date_regex=None):
+    """
+    rename files to sha256 name and put them in the unknown directory
+    """
+    status = 'other'
+    info = source_file
+    #print(source_file, end="", flush=True)
+
+    exif_data = exif(source_file)
+
+
+    target_file_name = os.path.basename(source_file)
+    source_sha256 = sha256_checksum(source_file)
+    if is_image_or_video(exif_data):
+        date = get_date(source_file, exif_data, date_regex, True)
+        output_dir = get_output_dir(date, outputdir, dir_format)
+        base, ext = os.path.splitext(target_file_name)
+        target_file_name = source_sha256 + ext
+    else:
+        output_dir = get_output_dir(False, outputdir, dir_format)
+    target_file = os.path.sep.join([output_dir, target_file_name])
+
+    if os.path.isfile(target_file):
+        info += ' => skipped, duplicated file'
+        status = 'duplicate'
+    else:
+        if move_files:
+            shutil.move(source_file, target_file)
+            status = 'moved'
+        else:
+            shutil.copy2(source_file, target_file)
+            status = 'copied'
+
+    info += ' => %s' % target_file
+    logging.info(info)
+    return status
 
 
 def handle_file_xmp(source_file, photo_name, suffix, exif_output_dir, move_files):
@@ -280,7 +378,7 @@ def handle_file_xmp(source_file, photo_name, suffix, exif_output_dir, move_files
 
     if xmp_original:
         xmp_path = os.path.sep.join([exif_output_dir, xmp_target])
-        print('%s => %s' % (xmp_original, xmp_path))
+        logging.info('%s => %s' % (xmp_original, xmp_path))
 
         if move_files:
             shutil.move(xmp_original, xmp_path)
@@ -341,6 +439,9 @@ OPTIONS
             YYYY/m/DD  -> 2011/Jul/17
             YY/m-DD    -> 11/Jul-17
 
+    -s | --sha-rename
+        rename all files to the SHA256 key - used mainly as a second pass to clean the unknown directory
+
     -h | --help
         Display this help.
 
@@ -352,6 +453,9 @@ OPTIONS
     -r | --regex
         Specify date format for date extraction from filenames
         if there is no EXIF date information.
+
+    -l | --log
+        Redirect verbose output to named log file
         
         Example:
             {regex}
